@@ -625,6 +625,12 @@
                                       :ex/related #{:ex/a :ex/b}}
                                      supers))
         "several subproperties together")
+    (is (= {:ex/kin #{:ex/related}}
+           (theo/entailed-properties {:ex/child   :ex/c
+                                      :ex/kin     #{:ex/a :ex/b}
+                                      :ex/related #{:ex/a :ex/b}}
+                                     supers))
+        "not under a subproperty that has none of its values")
     (is (= {}
            (theo/entailed-properties {:ex/child :ex/a :ex/kin #{:ex/a :ex/c}}
                                      supers))

@@ -682,10 +682,11 @@
   from the superproperties function, e.g. {:wn/hypernym #{:skos/broader}}.
 
   A property is entailed when each of its values is also a value of one of
-  its subproperties in `e`. An entailed property is never a key, so
-  :skos/broaderTransitive is listed under :wn/hypernym rather than under
-  :skos/broader. This relies on the relation being transitive and without
-  equivalent properties, as superproperties returns it."
+  its subproperties in `e`, and it's listed under the ones that have a value
+  of it. An entailed property is never a key, so :skos/broaderTransitive is
+  listed under :wn/hypernym rather than under :skos/broader. This relies on
+  the relation being transitive and without equivalent properties, as
+  superproperties returns it."
   [e superproperties]
   (let [subs-of   (reduce-kv (fn [m p _]
                                (reduce (fn [m super]
@@ -708,12 +709,15 @@
                           v    (get e super)]
                       (every? (fn [x] (some #(contains? % x) subs))
                               (if (or (set? v) (sequential? v)) v [v]))))
-        entailed  (into #{} (filter entailed?) (keys subs-of))]
+        entailed  (into #{} (filter entailed?) (keys subs-of))
+        entails?  (fn [p super]
+                    (and (not (contains? entailed p))
+                         (some #(contains? (set-of super) %) (set-of p))))]
     (reduce (fn [m super]
               (reduce (fn [m p]
-                        (if (contains? entailed p)
-                          m
-                          (update m p (fnil conj #{}) super)))
+                        (if (entails? p super)
+                          (update m p (fnil conj #{}) super)
+                          m))
                       m
                       (subs-of super)))
             {}
