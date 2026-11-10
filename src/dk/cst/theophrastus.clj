@@ -5,20 +5,24 @@
             [dk.cst.theophrastus.impl.dataset :as dataset]
             [dk.cst.theophrastus.impl.entity :as entity]
             [dk.cst.theophrastus.impl.files :as files]
+            [dk.cst.theophrastus.origin :as origin]
             [dk.cst.theophrastus.sparql :as sparql]
             [dk.cst.theophrastus.txn :as txn]
             [dk.cst.theophrastus.term :as term]
             [clojure.java.io :as io])
   (:import [clojure.lang IReduceInit]
            [java.io OutputStream Writer]
-           [org.apache.jena.graph Graph GraphMemFactory GraphUtil Node Triple]
+           [java.util ArrayList Collection HashMap HashSet Iterator
+            LinkedHashMap List Map Set]
+           [org.apache.jena.graph Graph GraphMemFactory GraphUtil Node
+            NodeFactory Triple]
            [org.apache.jena.query ARQ Dataset DatasetFactory Query QueryFactory
             Syntax]
            [org.apache.jena.rdf.model Model ModelFactory]
            [org.apache.jena.reasoner BaseInfGraph]
            [org.apache.jena.riot RDFWriter]
            [org.apache.jena.shared PrefixMapping]
-           [org.apache.jena.sparql.core DatasetGraph]
+           [org.apache.jena.sparql.core DatasetGraph GraphView Quad]
            [org.apache.jena.tdb2 DatabaseMgr TDB2]
            [org.apache.jena.update UpdateFactory UpdateRequest]))
 
@@ -489,62 +493,360 @@
                 (convert/data (.getObject t) prefixes)]))
         triples))
 
-(defn- inferred
-  "The property map of the `pairs` of a subject's Jena `triples` (in the same
-  order) that the inference Model of `db` infers, rather than finds in its
-  raw graph or schema."
-  [{:keys [^Model model] :as db} triples pairs]
-  ;; one find per asserted graph, as a Graph.contains call per triple is slow
-  ;; for a subject with many triples
-  (let [^BaseInfGraph g (.getGraph model)
-        s               (.getSubject ^Triple (first triples))
-        triples-of      (fn [^Graph a] (.toList (.find a s Node/ANY Node/ANY)))
-        asserted        (->> [(.getRawGraph g) (.getSchemaGraph g)]
-                             (keep identity)
-                             (into #{} (mapcat triples-of)))]
-    (->> (map (fn [t pair] (when-not (asserted t) pair)) triples pairs)
-         (remove nil?)
-         (entity/property-map))))
+(defn- origin-selection
+  "The origins that the :origins option `x` selects, with `prefixes` for
+  IRIs: the IRIs of the :graphs (or :all), the :special origins, and the
+  :names to record them under when `x` renames them."
+  [x prefixes]
+  (let [canonical (fn [o]
+                    (or (origin/special-origins o)
+                        (term/iri o prefixes)
+                        (throw (ex-info (str "Not an origin: " (pr-str o))
+                                        {:origin o}))))
+        selection (fn [os]
+                    (let [cs (map canonical os)]
+                      {:graphs  (into #{} (remove keyword?) cs)
+                       :special (into #{} (filter keyword?) cs)}))]
+    (cond
+      (true? x) {:graphs :all :special origin/special-origins}
+      (set? x)  (selection x)
+      (map? x)  (assoc (selection (keys x)) :names (update-keys x canonical))
+      :else     (throw (ex-info (str "Not an :origins option: " (pr-str x))
+                                {:origins x})))))
+
+(defn- origin-namer
+  "A function of an origin, a graph Node or a keyword, to the name that the
+  `selection` records it under, or nil when it isn't selected, with
+  `prefixes` for IRIs."
+  [{:keys [graphs special names]} prefixes]
+  (let [cache (HashMap.)]
+    (fn [o]
+      (if (keyword? o)
+        (when (contains? special o)
+          (get names o o))
+        (if (.containsKey cache o)
+          (.get cache o)
+          (let [iri (.getURI ^Node o)
+                n   (when (or (= :all graphs) (contains? graphs iri))
+                      (if names
+                        (get names iri)
+                        (convert/data o prefixes)))]
+            (.put cache o n)
+            n))))))
+
+(defn- default-name
+  "The :default-origin `x` as the `selection` names origins, with
+  `prefixes` for IRIs, so that it compares with the names recorded."
+  [x {:keys [names]} prefixes]
+  (let [iri (when-not (or (origin/special-origins x)
+                          (some #{x} (vals names)))
+              (term/iri x prefixes))]
+    (cond
+      (nil? iri) x
+      names      (get names iri x)
+      :else      (convert/data (NodeFactory/createURI ^String iri) prefixes))))
+
+(defn- graph-scope
+  "The named graphs that the Graph `g` is a view of, as its :dsg and its
+  :graphs (:all, or a set of graph Nodes), or nil for a graph without a
+  name."
+  [^Graph g]
+  (when (instance? GraphView g)
+    (let [n (.getGraphName ^GraphView g)]
+      (when-not (or (nil? n) (Quad/isDefaultGraph n))
+        {:dsg    (.getDataset ^GraphView g)
+         :graphs (if (Quad/isUnionGraph n) :all #{n})}))))
+
+(defn- origin-sources
+  "Where the triples are that `db` reads with its Graph `g`: in its :named
+  graphs (see graph-scope), read as the :named-graph, in its :unnamed
+  Graphs, and, when `g` :infers?, nowhere."
+  [{:keys [^Dataset dataset default-graph]} ^Graph g]
+  (cond
+    (instance? BaseInfGraph g)
+    (let [raw    (.getRawGraph ^BaseInfGraph g)
+          schema (.getSchemaGraph ^BaseInfGraph g)
+          scope  (graph-scope raw)]
+      {:named       scope
+       :named-graph raw
+       :unnamed     (cond-> []
+                      (nil? scope)   (conj raw)
+                      (some? schema) (conj schema))
+       :infers?     true})
+
+    (and dataset (set? default-graph))
+    {:named {:dsg    (.asDatasetGraph dataset)
+             :graphs (into #{} (map #(NodeFactory/createURI ^String %))
+                           default-graph)}}
+
+    :else
+    (if-let [scope (graph-scope g)]
+      {:named scope}
+      {:unnamed [g]})))
+
+(defn- constant-origin
+  "The origin of every triple from the `sources`, named by `name-of`, when
+  they hold just one graph and infer nothing, or ::varies."
+  [{:keys [named unnamed infers?]} name-of]
+  (let [graphs (:graphs named)]
+    (cond
+      infers?                                  ::varies
+      (and (nil? named) (= 1 (count unnamed))) (name-of :asserted)
+      (and (set? graphs) (= 1 (count graphs))) (name-of (first graphs))
+      :else                                    ::varies)))
+
+(defn- find-set
+  "The triples of the Graph `g` that match s p o."
+  ^Set [^Graph g ^Node s ^Node p ^Node o]
+  (HashSet. ^Collection (.toList (.find g s p o))))
+
+(defn- add-quads!
+  "Add each of the `quads` to the map `m` of a triple to the graph Node
+  that holds it, or to a set of the Nodes when several do."
+  [^Map m ^Iterator quads]
+  (while (.hasNext quads)
+    (let [^Quad q (.next quads)
+          t       (.asTriple q)
+          g       (.getGraph q)
+          held    (.get m t)]
+      (.put m t (cond
+                  (nil? held) g
+                  (set? held) (conj held g)
+                  :else       #{held g})))))
+
+(defn- named-triples
+  "A map of each triple that matches s p o in the named graphs of a scope
+  (see graph-scope) to the graph Node that holds it, or a set of the Nodes
+  when several do, in the order found. Only the `wanted` graphs are read:
+  :all, or a set of graph IRIs."
+  ^Map [{:keys [^DatasetGraph dsg graphs]} wanted ^Node s ^Node p ^Node o]
+  (let [m (LinkedHashMap.)]
+    ;; one find of the quads in all of them, or one find per graph
+    (if (and (= :all graphs) (= :all wanted))
+      (add-quads! m (.findNG dsg Node/ANY s p o))
+      (doseq [^Node n (cond
+                        (= :all wanted) graphs
+                        (= :all graphs) (map #(NodeFactory/createURI ^String %)
+                                             wanted)
+                        :else           (filter #(contains? wanted
+                                                            (.getURI ^Node %))
+                                                graphs))]
+        (add-quads! m (.find dsg n s p o))))
+    m))
+
+(defn- one-or-set
+  "The single one of the `names`, a set of them when there are several, or
+  nil when there are none."
+  [names]
+  (case (count names)
+    0 nil
+    1 (first names)
+    names))
+
+(defn- held-name
+  "The name of the origin of a triple that `held`, a graph Node or a set of
+  them, holds, as `name-of` gives it, or nil."
+  [name-of held]
+  (if (set? held)
+    (one-or-set (into #{} (keep name-of) held))
+    (some-> held name-of)))
+
+(defn- triple-origin
+  "A function of a triple that matches s p o to the name of its origin, as
+  `name-of` gives it for the `selection`, from the `sources`. The graphs
+  are read once, for all the triples that match."
+  [{:keys [named named-graph unnamed infers?]} {:keys [graphs special]}
+   name-of ^Node s ^Node p ^Node o]
+  (let [asserted? (contains? special :asserted)
+        inferred? (and infers? (contains? special :inferred))
+        by-graph  (when (and named (or (= :all graphs) (seq graphs)))
+                    (named-triples named graphs s p o))
+        unnamed   (when (or asserted? inferred?)
+                    (mapv #(find-set % s p o) unnamed))
+        ;; the triples of every named graph, to tell an inferred triple
+        ;; from one in a graph that isn't selected
+        in-named  (when (and inferred? named)
+                    (if (= :all graphs)
+                      (.keySet ^Map by-graph)
+                      (find-set named-graph s p o)))]
+    (fn [t]
+      (let [held     (when by-graph (.get ^Map by-graph t))
+            unnamed? (some #(.contains ^Set % t) unnamed)]
+        (cond
+          ;; the usual case: one named graph holds the triple
+          (and (instance? Node held) (not (and asserted? unnamed?)))
+          (name-of held)
+
+          (nil? held)
+          (if unnamed?
+            (when asserted?
+              (name-of :asserted))
+            (when (and inferred?
+                       (not (and in-named (.contains ^Set in-named t))))
+              (name-of :inferred)))
+
+          :else
+          (one-or-set (cond-> (into #{} (keep name-of)
+                                    (if (set? held) held (some-> held list)))
+                        (and asserted? unnamed?) (conj (name-of :asserted)))))))))
+
+(defn- origin-recording
+  "How to record the origins of the values that `db` reads with its Graph
+  `g`, as the `opts` of entity ask for them, or nil when they ask for none:
+  a function of a find pattern s p o to a function of each triple that
+  matches it to its origin, unless every triple has the same :constant
+  origin, the :default-origin, and the named graphs whose :quads to read
+  instead of triples. With :blank-node-origins?, the maps of blank nodes get
+  their origins too."
+  ;; a boolean option ends in ?, as :transactional? of db does
+  [{:keys [prefixes] :as db} g
+   {:keys [origins default-origin blank-node-origins?]}]
+  (when (or origins (some? default-origin) blank-node-origins?)
+    (let [selection (origin-selection (or origins true) prefixes)
+          name-of   (origin-namer selection prefixes)
+          sources   (origin-sources db g)
+          constant  (constant-origin sources name-of)]
+      {:name-of             name-of
+       :origin-of           (fn [s p o]
+                              (triple-origin sources selection name-of s p o))
+       :constant            constant
+       :default-origin      (some-> default-origin
+                                    (default-name selection prefixes))
+       :blank-node-origins? blank-node-origins?
+       ;; without inference, the quads of a subject are its triples and
+       ;; their graphs in one read
+       :quads               (when (and (= ::varies constant)
+                                       (not (:infers? sources)))
+                              (:named sources))})))
+
+(defn- origins-meta
+  "The metadata of the entity `e` with the origins of its values, as the
+  `recording` has them, from the Jena `triples` of its subject Node `s` and
+  their [p o] `pairs`. The function `origin-of-triple` gives the origin of
+  each triple when the triples were read with their graphs."
+  [{:keys [origin-of constant default-origin]} e ^Node s ^List triples pairs
+   origin-of-triple]
+  (let [origins (cond
+                  (= ::varies constant)
+                  (let [origin-of-triple (or origin-of-triple
+                                             (origin-of s Node/ANY Node/ANY))
+                        by-property      (HashMap.)]
+                    (dotimes [i (.size triples)]
+                      (when-some [o (origin-of-triple (.get triples i))]
+                        (let [[p x]   (nth pairs i)
+                              ^Map xs (or (.get by-property p)
+                                          (let [xs (HashMap.)]
+                                            (.put by-property p xs)
+                                            xs))]
+                          (.put xs x o))))
+                    (origin/origins e
+                                    (fn [p x]
+                                      (when-some [^Map xs (.get by-property p)]
+                                        (.get xs x)))
+                                    default-origin))
+
+                  ;; every value has the one origin, or none is recorded
+                  (or (nil? constant) (= constant default-origin))
+                  {}
+
+                  :else
+                  (into {}
+                        (keep (fn [k] (when-not (= :rdf/about k) [k constant])))
+                        (keys e)))]
+    (cond-> {:origins origins}
+      (some? default-origin) (assoc :default-origin default-origin))))
+
+(defn- read-entity
+  "The entity of `subject` that `db` reads with its Graph `g`, with the
+  origins of its values in its metadata when there's a `recording` of
+  them, and in the maps of its blank nodes when it asks for those too."
+  [{:keys [prefixes]} ^Graph g {:keys [quads name-of blank-node-origins?]
+                                :as   recording} subject]
+  (let [triples  (if quads
+                   (fn [^Node n]
+                     (let [m (named-triples quads :all n Node/ANY Node/ANY)]
+                       [(ArrayList. (.keySet m))
+                        (fn [t] (held-name name-of (.get m t)))]))
+                   (fn [^Node n]
+                     [(.toList (.find g n Node/ANY Node/ANY)) nil]))
+        ;; the triples of each blank node, read once for its map and its
+        ;; origins
+        read     (when blank-node-origins? (HashMap.))
+        pairs-of (fn [s]
+                   (let [n                (convert/node s prefixes)
+                         [ts origin-of-t] (triples n)
+                         ps               (property-pairs ts prefixes)]
+                     (when read (.put read s [n ts ps origin-of-t]))
+                     ps))
+        meta-of  (when blank-node-origins?
+                   (fn [s e]
+                     (let [[n ts ps origin-of-t] (.get read s)]
+                       (origins-meta recording e n ts ps origin-of-t))))
+        n        (convert/node subject prefixes)
+        [ts origin-of-t] (triples n)]
+    (when (seq ts)
+      (let [pairs (property-pairs ts prefixes)
+            e     (assoc (entity/describe pairs-of pairs #{subject} meta-of)
+                    :rdf/about subject)]
+        (cond-> e
+          recording (with-meta (origins-meta recording e n ts pairs
+                                             origin-of-t)))))))
 
 ;; TODO: an option for one value or a set by a schema, as in Datomic, e.g.
 ;; SHACL's sh:maxCount 1 or owl:FunctionalProperty, instead of by the data
 (defn entity
   "A map of the properties of `subject` in `db`, with :rdf/about for the
   subject, or nil when it has none. A property has one value, or a set when
-  it has several.
+  it has several. The entity is read in one read transaction.
 
   A blank node among the values becomes a map of its own properties, as in
   a Concise Bounded Description, so the entity can go back into transact!
-  as it is. For a db of an inference Model, the :inferred metadata has the
-  properties that the Model infers (those in neither its raw graph nor its
-  schema). The entity is read in one read transaction."
-  [{:keys [^Model model prefixes] :as db} subject]
-  (txn/calculate-read
-    db
-    #(let [g               (query-graph db)
-           subject-triples (fn [s]
-                             (.toList (.find g (convert/node s prefixes)
-                                             Node/ANY
-                                             Node/ANY)))
-           pairs-of        (fn [s]
-                             (property-pairs (subject-triples s) prefixes))]
-       (when-let [ts (not-empty (subject-triples subject))]
-         (let [pairs (property-pairs ts prefixes)]
-           (cond-> (assoc (entity/describe pairs-of pairs #{subject})
-                     :rdf/about subject)
-             (and model (instance? BaseInfGraph (.getGraph model)))
-             (with-meta {:inferred (inferred db ts pairs)})))))))
+  as it is. The `opts` record the origins of the values in the metadata of
+  the entity, as the origin namespace describes them:
 
-(defn- links-to
-  "The subjects in the Graph `g` that link to `subject` by the predicate `p`
-  (one, a set, or nil for none), with `prefixes` for keywords."
-  [^Graph g p subject prefixes]
-  (entity/property-value
-    (map #(convert/data (.getSubject ^Triple %) prefixes)
-         (.toList (.find g
-                         Node/ANY
-                         (convert/node p prefixes)
-                         (convert/node subject prefixes))))))
+  - :origins, the origins to record: true for all of them, a set of
+    origins for only those, or a map of origin to name for only those,
+    renamed. An origin is the IRI of a named graph, :asserted or :inferred.
+  - :default-origin, the origin of every value that has no entry. Values
+    of this origin get none, and :origins is true when it isn't given.
+  - :blank-node-origins?, true to record them in the map of each blank
+    node too. As with :default-origin, :origins is true when it isn't
+    given."
+  ([db subject]
+   (entity db subject nil))
+  ([db subject opts]
+   (txn/calculate-read
+     db
+     #(let [g (query-graph db)]
+        (read-entity db g (origin-recording db g opts) subject)))))
+
+(defn- link-origins
+  "The origins of the `links`, a map of a reverse predicate to the subjects
+  that link to `subject` by it, as the `recording` has them. The triples
+  of each link are in `read`, by predicate and subject."
+  [{:keys [origin-of constant default-origin]} ^Map read links subject
+   prefixes]
+  (let [s       (convert/node subject prefixes)
+        by-link (when (= ::varies constant)
+                  (into {}
+                        (for [rp (keys links)
+                              :let [p         (convert/reverse-property rp)
+                                    origin-of (origin-of
+                                                Node/ANY
+                                                (convert/node p prefixes)
+                                                s)]]
+                          [rp (into {}
+                                    (keep (fn [^Triple t]
+                                            (when-some [o (origin-of t)]
+                                              [(convert/data (.getSubject t)
+                                                             prefixes)
+                                               o])))
+                                    (.get read [p subject]))])))]
+    (origin/origins links
+                    (if by-link
+                      (fn [rp x] (get-in by-link [rp x]))
+                      (constantly constant))
+                    default-origin)))
 
 (defn pull
   "The properties of `subject` in `db` that the `pattern` selects, as in
@@ -563,13 +865,45 @@
 
   A property has one value, or a set when it has several. A recursion stops
   at a subject that it has already pulled on the way. The pull is read in
-  one read transaction."
-  [{:keys [prefixes] :as db} pattern subject]
-  (txn/calculate-read
-    db
-    #(let [g (query-graph db)]
-       ;; as functions, since impl.entity can't require this namespace
-       (entity/pull {:entity   (fn [s] (entity db s))
-                     :links-to (fn [p s] (links-to g p s prefixes))}
-                    pattern
-                    subject))))
+  one read transaction. The `opts` are those of entity. They record the
+  origins of the values in the metadata of each map that the pull returns,
+  links to the subject included. The map of a blank node among the values
+  only gets them with :blank-node-origins?."
+  ([db pattern subject]
+   (pull db pattern subject nil))
+  ([{:keys [prefixes] :as db} pattern subject opts]
+   (txn/calculate-read
+     db
+     #(let [g              (query-graph db)
+            recording      (origin-recording db g opts)
+            default-origin (:default-origin recording)
+            read           (when recording (HashMap.))
+            links-to       (fn [p s]
+                             (let [ts (.toList
+                                        (.find g Node/ANY
+                                               (convert/node p prefixes)
+                                               (convert/node s prefixes)))]
+                               (when read (.put read [p s] ts))
+                               (entity/property-value
+                                 (map (fn [^Triple t]
+                                        (convert/data (.getSubject t) prefixes))
+                                      ts))))]
+        ;; as functions, since impl.entity can't require this namespace
+        (entity/pull (cond-> {:entity   (fn [s] (read-entity db g recording s))
+                              :links-to links-to}
+                       recording
+                       (assoc :meta
+                              (fn [subject e ks links]
+                                ;; none for a blank node's map read without
+                                ;; its origins, which would seem to have none
+                                (when-not (and e (nil? (meta e)))
+                                  (cond-> {:origins
+                                           (merge (select-keys
+                                                    (:origins (meta e)) ks)
+                                                  (link-origins
+                                                    recording read links
+                                                    subject prefixes))}
+                                    (some? default-origin)
+                                    (assoc :default-origin default-origin))))))
+                     pattern
+                     subject)))))

@@ -54,12 +54,13 @@
                                                   (model-of schema)
                                                   (model-of data))
                                  {:prefixes prefixes})
-                rex      (theo/entity db :ex/rex)]]
+                rex      (theo/entity db :ex/rex {:origins #{:inferred}})]]
     (is (= {:rdf/about :ex/b :ex/knows :ex/a} (theo/entity db :ex/b))
         (str mode))
     (is (= #{:ex/Dog :ex/Animal} (:rdf/type rex))
         (str mode ", with the schema"))
-    (is (= {:rdf/type :ex/Animal} (:inferred (meta rex))) (str mode)))
+    (is (= {:rdf/type {:ex/Animal :inferred}} (:origins (meta rex)))
+        (str mode)))
   (is (thrown-with-msg? ExceptionInfo #"Not a mode"
                         (rules/reasoner [] {:mode :sideways}))))
 
@@ -74,14 +75,19 @@
                                           (model-of schema)
                                           (.getUnionModel ds))
                          {:prefixes prefixes})]
-    (is (= {:ex/knows :ex/a} (:inferred (meta (theo/entity db :ex/b))))
-        "an inference Model on the union of a TDB2 dataset")))
+    (is (= {:ex/knows :inferred}
+           (:origins (meta (theo/entity db :ex/b {:origins true}))))
+        "an inference Model on the union of a TDB2 dataset")
+    (is (= {:ex/knows :ex/g}
+           (:origins (meta (theo/entity db :ex/a {:origins true}))))
+        "with the named graph of an asserted value")))
 
 (deftest inf-model-sources
   (let [reasoner (rules/reasoner (rules/parse rule-text))
         db       (theo/db (rules/inf-model reasoner) {:prefixes prefixes})]
     (theo/transact! db data)
-    (is (= {:ex/knows :ex/a} (:inferred (meta (theo/entity db :ex/b))))
+    (is (= {:ex/knows :inferred}
+           (:origins (meta (theo/entity db :ex/b {:origins #{:inferred}}))))
         "a new in-memory Model"))
   (let [reasoner  (rules/reasoner (rules/parse rule-text))
         base      (theo/db (TDB2Factory/createDataset) {:prefixes prefixes})

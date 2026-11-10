@@ -441,7 +441,7 @@
            (:ex/start (theo/entity db :ex/loop)))
         "a cycle of blank nodes stops at the first one seen again")
     (is (nil? (theo/entity db :ex/nobody)))
-    (is (nil? (:inferred (meta luke))) "no inference model")))
+    (is (nil? (meta luke)) "no origins unless the opts ask for them")))
 
 (deftest triples
   (doseq [db (people-dbs)]
@@ -458,28 +458,53 @@
     (is (thrown-with-msg? ExceptionInfo #"Not a pattern"
                           (theo/triples db [:ex/luke :ex/name])))))
 
-(deftest inferred-entity
-  (let [schema [[:ex/Dog :rdfs/subClassOf :ex/Animal]]
-        data   [[:ex/rex :rdf/type :ex/Dog] [:ex/rex :ex/name "Rex"]]
-        mem-db #(theo/db (ModelFactory/createDefaultModel) {:prefixes prefixes})
-        rdfs   #(ModelFactory/createInfModel
-                  (ReasonerRegistry/getRDFSReasoner)
-                  (:model (theo/transact! (mem-db) schema))
-                  ^Model %)
-        tdb2   (TDB2Factory/createDataset)]
-    ;; the union model of TDB2 has the named graphs, not the default one
-    (theo/transact! (theo/named-graph (theo/db tdb2 {:prefixes prefixes}) :ex/g)
-                    data)
-    (doseq [model [(rdfs (:model (theo/transact! (mem-db) data)))
-                   (rdfs (.getUnionModel tdb2))]
-            :let [rex      (theo/entity (theo/db model {:prefixes prefixes})
-                                       :ex/rex)
-                  inferred (:inferred (meta rex))
-                  types    #(let [t (:rdf/type %)] (if (set? t) t #{t}))]]
-      (is (contains? (types rex) :ex/Animal))
-      (is (contains? (types inferred) :ex/Animal))
-      (is (not (contains? (types inferred) :ex/Dog)) "asserted in the data")
-      (is (not (contains? inferred :ex/name))))))
+(deftest inferred-origins
+  (let [schema  [[:ex/Dog :rdfs/subClassOf :ex/Animal]]
+        data    [[:ex/rex :rdf/type :ex/Dog]
+                 [:ex/rex :ex/name "Rex"]
+                 {:rdf/about :ex/rex :ex/collar {:ex/colour "red"}}]
+        mem-db  #(theo/db (ModelFactory/createDefaultModel) {:prefixes prefixes})
+        rdfs    #(ModelFactory/createInfModel
+                   (ReasonerRegistry/getRDFSReasoner)
+                   (:model (theo/transact! (mem-db) schema))
+                   ^Model %)
+        tdb2    (TDB2Factory/createDataset)
+        ;; the union model of TDB2 has the named graphs, not the default one
+        _       (theo/transact! (theo/named-graph (theo/db tdb2 {:prefixes prefixes})
+                                                  :ex/g)
+                                data)
+        model   (theo/db (rdfs (:model (theo/transact! (mem-db) data)))
+                         {:prefixes prefixes})
+        union   (theo/db (rdfs (.getUnionModel ^Dataset tdb2))
+                         {:prefixes prefixes})
+        origins #(meta (theo/entity %1 :ex/rex %2))]
+    (is (= {:origins {:rdf/type {:ex/Animal :inferred}}}
+           (origins model {:origins #{:inferred}})
+           (origins union {:origins #{:inferred}}))
+        "the values that the Model infers")
+    (is (= {:origins {:rdf/type  {:ex/Dog :asserted :ex/Animal :inferred}
+                      :ex/name   :asserted
+                      :ex/collar :asserted}}
+           (origins model {:origins true}))
+        "the data of a Model has no named graph")
+    (is (= {:origins {:rdf/type  {:ex/Dog :ex/g :ex/Animal :inferred}
+                      :ex/name   :ex/g
+                      :ex/collar :ex/g}}
+           (origins union {:origins true}))
+        "the union of a Dataset has named graphs")
+    (is (= {:origins        {:rdf/type {:ex/Animal :inferred}}
+            :default-origin :ex/g}
+           (origins union {:default-origin "<http://example.com/g>"}))
+        "no entry for a value of the default origin, with :origins true")
+    (is (nil? (meta (:ex/collar (theo/entity union :ex/rex {:origins true}))))
+        "a blank node has no origins unless the opts ask for them")
+    (is (= {:origins {:ex/colour :ex/g}}
+           (meta (:ex/collar (theo/entity union :ex/rex
+                                          {:blank-node-origins? true}))))
+        "a blank node has the origins of its own values")
+    (is (= (origins union {:origins true})
+           (origins union {:blank-node-origins? true}))
+        "all the origins of the entity, with :origins true")))
 
 (deftest pull
   (doseq [db (people-dbs)]
@@ -527,6 +552,39 @@
           "unlimited recursion")
       (is (= :ex/luke (-> (jim '...) :ex/friends :ex/friends :ex/friends))
           "a recursion stops at a subject already pulled"))))
+
+(deftest pull-origins
+  (let [ds      (TDB2Factory/createDataset)
+        base    (theo/db ds {:prefixes prefixes})
+        _       (theo/transact! (theo/named-graph base :ex/g) people)
+        _       (theo/transact! (theo/named-graph base :ex/h)
+                                [[:ex/luke :ex/name "Luke"]])
+        db      (theo/db ds {:prefixes prefixes :default-graph :union})
+        luke    (theo/pull db [:ex/name {:ex/spouse [:ex/name]} :ex/_friends]
+                           :ex/luke
+                           {:origins true})
+        address #(:ex/address (theo/pull db %1 :ex/luke %2))]
+    (is (= {:origins {:ex/name     #{:ex/g :ex/h}
+                      :ex/spouse   :ex/g
+                      :ex/_friends :ex/g}}
+           (meta luke))
+        "the properties pulled and the links to the subject")
+    (is (= {:origins {:ex/name :ex/g}} (meta (:ex/spouse luke)))
+        "each map pulled")
+    (is (nil? (meta (address [{:ex/address [:ex/city]}] {:origins true})))
+        "a blank node has no origins unless the opts ask for them")
+    (is (= {:origins {:ex/city :ex/g}}
+           (meta (address [{:ex/address [:ex/city]}]
+                          {:blank-node-origins? true})))
+        "a blank node that the pattern pulls")
+    (is (= {:origins {:ex/city :ex/g :ex/building :ex/g}}
+           (meta (address [:ex/address] {:blank-node-origins? true})))
+        "a blank node among the values")
+    (is (= {:origins {:ex/name #{:ex/g :ex/h}} :default-origin :ex/g}
+           (meta (theo/pull db [:ex/name :ex/_friends] :ex/luke
+                            {:default-origin :ex/g}))))
+    (is (nil? (meta (theo/pull db [:ex/name] :ex/luke)))
+        "no origins unless the opts ask for them")))
 
 (deftest union-default-graph
   (let [dataset (TDB2Factory/createDataset)
@@ -591,6 +649,39 @@
                                  {:default-graph :union})))
   (is (thrown-with-msg? ExceptionInfo #"Not a graph name"
                         (theo/db {:default-graph :nope/g}))))
+
+(deftest graph-origins
+  (doseq [ds [(DatasetFactory/createTxnMem) (TDB2Factory/createDataset)]
+          :let [db      (graphs-db ds)
+                _       (theo/transact! (theo/named-graph db :ex/g2)
+                                        [[:ex/a :ex/p "a"] [:ex/a :ex/q "q"]])
+                at      #(theo/db ds {:prefixes prefixes :default-graph %})
+                origins #(:origins (meta (theo/entity %1 :ex/a %2)))]]
+    (is (= {:ex/p #{:ex/g1 :ex/g2} :ex/q :ex/g2}
+           (origins (at :union) {:origins true})
+           (origins (at #{:ex/g1 :ex/g2}) {:origins true}))
+        "a set of the graphs when several hold a value")
+    (is (= {:ex/p :ex/g1} (origins (at :ex/g1) {:origins true}))
+        "a named graph")
+    (is (= {:ex/p :asserted}
+           (:origins (meta (theo/entity (at nil) :ex/d {:origins true}))))
+        "the default graph has no name")
+    (is (= {:ex/p :ex/g1} (origins (at :union) {:origins #{:ex/g1}}))
+        "only the origins selected")
+    (is (= {:ex/p #{:one :two} :ex/q :two}
+           (origins (at :union) {:origins {:ex/g1                     :one
+                                           "<http://example.com/g2>" :two}}))
+        "renamed")
+    (is (= {:ex/p :both :ex/q :both}
+           (origins (at :union) {:origins {:ex/g1 :both :ex/g2 :both}}))
+        "merged by one name")
+    (is (= {:ex/p #{:ex/g1 :ex/g2}}
+           (origins (at :union) {:default-origin :ex/g2}))
+        "a value of the default origin and another has an entry")
+    (is (thrown-with-msg? ExceptionInfo #"Not an origin: :nope"
+                          (origins (at :union) {:origins #{:nope}})))
+    (is (thrown-with-msg? ExceptionInfo #"Not an :origins option: :all"
+                          (origins (at :union) {:origins :all})))))
 
 (deftest transact-db
   (let [tdb2 (theo/transact! (theo/db (TDB2Factory/createDataset)

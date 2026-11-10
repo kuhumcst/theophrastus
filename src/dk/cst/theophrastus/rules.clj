@@ -2,8 +2,8 @@
   "Jena's rule reasoner: parse rules, make a reasoner of them, make an
   inference Model with it, and read its schema or check its consistency.
 
-  Pass the inference Model to theo/db, and an entity of the db has the
-  properties that the rules infer as :inferred in its metadata.
+  Pass the inference Model to theo/db, and theo/entity can record which
+  values of an entity the rules infer, with {:origins #{:inferred}}.
 
   See https://jena.apache.org/documentation/inference/"
   (:require [clojure.string :as str]

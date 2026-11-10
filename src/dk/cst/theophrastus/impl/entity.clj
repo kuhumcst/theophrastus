@@ -40,12 +40,17 @@
 (defn describe
   "The property map of a subject's [p o] `pairs`. Each blank node among the
   values becomes the map of its own pairs, from `pairs-of`, with its
-  :rdf/about, unless it's one of the subjects `seen` on the way there."
-  [pairs-of pairs seen]
+  :rdf/about, unless it's one of the subjects `seen` on the way there. The
+  `meta-of` function of a blank node and its map, unless nil, returns the
+  metadata of the map."
+  [pairs-of pairs seen meta-of]
   (let [expand (fn [x]
                  (if (and (term/blank-node? x) (not (seen x)))
-                   (assoc (describe pairs-of (pairs-of x) (conj seen x))
-                     :rdf/about x)
+                   (let [m (assoc (describe pairs-of (pairs-of x)
+                                            (conj seen x) meta-of)
+                             :rdf/about x)]
+                     (cond-> m
+                       meta-of (with-meta (meta-of x m))))
                    x))]
     (update-vals (property-map pairs) #(map-value expand %))))
 
@@ -84,10 +89,12 @@
 
   The `lookup` has two functions: :entity returns the entity of a subject,
   and :links-to returns the subjects that link to a subject by a
-  predicate, as a property value."
+  predicate, as a property value. A :meta function of the subject, its
+  entity, the keys of the properties selected from it and the map of its
+  links, when given, returns the metadata of each map pulled."
   ([lookup pattern x]
    (pull lookup pattern x 0 #{}))
-  ([{:keys [entity links-to] :as lookup} pattern x depth seen]
+  ([{:keys [entity links-to] meta-of :meta :as lookup} pattern x depth seen]
    (let [subject  (about x)
          e        (if (map? x) x (entity x))
          specs    (pattern-specs pattern)
@@ -98,7 +105,8 @@
                                                (links-to subject))]
                               :when (some? v)]
                           [p v]))
-         selected (merge (select-properties e specs) links)
+         own      (select-properties e specs)
+         selected (merge own links)
          pull-v   (fn [spec v]
                     (or (when (subject? v)
                           (cond
@@ -112,9 +120,10 @@
                             (pull lookup pattern v (inc depth) seen)))
                         v))]
      (when (or e (seq selected))
-       (into {:rdf/about subject}
-             (map (fn [[p v]]
-                    [p (if-let [spec (get specs p)]
-                         (map-value #(pull-v spec %) v)
-                         v)]))
-             selected)))))
+       (cond-> (into {:rdf/about subject}
+                     (map (fn [[p v]]
+                            [p (if-let [spec (get specs p)]
+                                 (map-value #(pull-v spec %) v)
+                                 v)]))
+                     selected)
+         meta-of (with-meta (meta-of subject e (keys own) links)))))))
