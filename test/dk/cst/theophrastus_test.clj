@@ -746,6 +746,18 @@
     (is (= :ex/a (:ex/knows (theo/entity copy :ex/b)))
         "the db of a CONSTRUCT")))
 
+(deftest transact-rdf-only
+  (let [m  (ModelFactory/createDefaultModel)
+        db (theo/db m {:prefixes prefixes})]
+    (doseq [t [['?s :ex/p "o"]
+               ["s" :ex/p "o"]
+               [:ex/s "p" "o"]
+               [:ex/s :ex/p '?o]]]
+      (is (thrown-with-msg? ExceptionInfo #"Not an RDF triple"
+                            (theo/transact! db [[:ex/a :ex/p "o"] t]))
+          (pr-str t)))
+    (is (zero? (.size m)) "nothing is written")))
+
 (deftest map-form
   (let [m  (ModelFactory/createDefaultModel)
         db (theo/db m {:prefixes prefixes})]

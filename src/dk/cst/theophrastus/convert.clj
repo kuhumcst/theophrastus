@@ -224,6 +224,17 @@
     (node about prefixes)
     (NodeFactory/createBlankNode)))
 
+;; RDF 1.1 Concepts, section 3.1
+(defn- rdf-triple
+  "The Jena triple of the nodes `s`, `p` and `o`, which have to make an RDF
+  triple: an IRI or a blank node as the subject, an IRI as the predicate,
+  and a term as the object, not a variable."
+  ^Triple [^Node s ^Node p ^Node o]
+  (if (and (or (.isURI s) (.isBlank s)) (.isURI p) (.isConcrete o))
+    (Triple/create s p o)
+    (throw (ex-info (str "Not an RDF triple: " s " " p " " o)
+                    {:triple [s p o]}))))
+
 (defn- conj-map-triples!
   "Add the Jena triples of the map `m`, whose subject is the node `s`, to
   the transient `acc`, with `prefixes` for keywords."
@@ -241,8 +252,8 @@
                                 (subject-node x prefixes)
                                 (node x prefixes))]
                         (cond-> (conj! acc (if reverse
-                                             (Triple/create o pred s)
-                                             (Triple/create s pred o)))
+                                             (rdf-triple o pred s)
+                                             (rdf-triple s pred o)))
                           (map? x) (conj-map-triples! x o prefixes)))))
                   acc
                   (if (or (set? v) (sequential? v)) v [v])))))
@@ -259,9 +270,9 @@
 
     (triple? tx-data)
     (let [[s p o] tx-data]
-      (conj! acc (Triple/create (node s prefixes)
-                                (node p prefixes)
-                                (node o prefixes))))
+      (conj! acc (rdf-triple (node s prefixes)
+                             (node p prefixes)
+                             (node o prefixes))))
 
     (coll? tx-data)
     (reduce #(conj-triples! %1 %2 prefixes) acc tx-data)
@@ -273,7 +284,9 @@
 ;; one transient vector for all of them, since tx-data can have millions
 (defn triples
   "The Jena triples of `tx-data` (as theo/transact! takes it), with
-  `prefixes` for keywords (term/default-prefixes when none are given)."
+  `prefixes` for keywords (term/default-prefixes when none are given). It
+  throws on a triple that RDF doesn't allow, e.g. one with a variable or a
+  literal subject."
   ([tx-data]
    (triples tx-data term/default-prefixes))
   ([tx-data prefixes]
