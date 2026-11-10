@@ -24,7 +24,8 @@
            [org.apache.jena.shared PrefixMapping]
            [org.apache.jena.sparql.core DatasetGraph GraphView Quad]
            [org.apache.jena.tdb2 DatabaseMgr TDB2]
-           [org.apache.jena.update UpdateFactory UpdateRequest]))
+           [org.apache.jena.update UpdateFactory UpdateRequest]
+           [org.apache.jena.vocabulary RDFS$Nodes]))
 
 (defrecord Db [model dataset prefixes default-graph])
 
@@ -907,3 +908,104 @@
                                     (assoc :default-origin default-origin))))))
                      pattern
                      subject)))))
+
+(defn- reachable
+  "The values that `x` reaches in the relation `m`, a map of each value to
+  the set of values it relates to."
+  [m x]
+  (loop [seen #{}
+         todo (vec (get m x))]
+    (if-let [y (peek todo)]
+      (if (contains? seen y)
+        (recur seen (pop todo))
+        (recur (conj seen y) (into (pop todo) (get m y))))
+      seen)))
+
+;; named for what it returns, as entity and triples are
+(defn superproperties
+  "A map of each property in `db` to its proper superproperties, from the
+  rdfs:subPropertyOf triples of `db`, e.g. {:wn/hypernym #{:skos/broader}}.
+  The relation is transitive, with or without inference, and it leaves out
+  the properties that are also subproperties, such as equivalent ones.
+
+  The map is read in one read transaction. Keep it for entailed-properties,
+  rather than read it again for each entity."
+  [{:keys [prefixes] :as db}]
+  (let [direct  (txn/calculate-read
+                  db
+                  #(reduce (fn [m ^Triple t]
+                             (let [s (.getSubject t)
+                                   o (.getObject t)]
+                               (if (and (.isURI s) (.isURI o))
+                                 (update m (convert/data s prefixes)
+                                         (fnil conj #{})
+                                         (convert/data o prefixes))
+                                 m)))
+                           {}
+                           (.toList (.find (query-graph db)
+                                           Node/ANY
+                                           RDFS$Nodes/subPropertyOf
+                                           Node/ANY))))
+        closure (into {}
+                      (map (fn [p] [p (reachable direct p)]))
+                      (keys direct))]
+    (into {}
+          (keep (fn [[p supers]]
+                  (when-some [supers (->> supers
+                                          (remove #(contains? (closure %) p))
+                                          (into #{})
+                                          (not-empty))]
+                    [p supers])))
+          closure)))
+
+(defn- value-set
+  "The values of the property value `v` as a set."
+  [v]
+  (cond
+    (set? v)        v
+    (sequential? v) (set v)
+    :else           #{v}))
+
+;; the entity first, as in origin/origins
+(defn entailed-properties
+  "The properties of the entity `e` that its other properties entail, by the
+  property that entails them, with the `superproperties` of each property
+  from the superproperties function, e.g. {:wn/hypernym #{:skos/broader}}.
+
+  A property is entailed when each of its values is also a value of one of
+  its subproperties in `e`. An entailed property is never a key, so
+  :skos/broaderTransitive is listed under :wn/hypernym rather than under
+  :skos/broader. This relies on the relation being transitive and without
+  equivalent properties, as superproperties returns it."
+  [e superproperties]
+  (let [subs-of   (reduce-kv (fn [m p _]
+                               (reduce (fn [m super]
+                                         (if (contains? e super)
+                                           (update m super (fnil conj []) p)
+                                           m))
+                                       m
+                                       (get superproperties p)))
+                             {}
+                             e)
+        sets      (HashMap.)
+        set-of    (fn [p]
+                    (or (.get sets p)
+                        (let [s (value-set (get e p))]
+                          (.put sets p s)
+                          s)))
+        entailed? (fn [super]
+                    ;; the largest first, as it most likely holds a value
+                    (let [subs (sort-by count > (map set-of (subs-of super)))
+                          v    (get e super)]
+                      (every? (fn [x] (some #(contains? % x) subs))
+                              (if (or (set? v) (sequential? v)) v [v]))))
+        entailed  (into #{} (filter entailed?) (keys subs-of))]
+    (reduce (fn [m super]
+              (reduce (fn [m p]
+                        (if (contains? entailed p)
+                          m
+                          (update m p (fnil conj #{}) super)))
+                      m
+                      (subs-of super)))
+            {}
+            entailed)))

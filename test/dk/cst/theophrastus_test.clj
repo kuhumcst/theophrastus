@@ -586,6 +586,57 @@
     (is (nil? (meta (theo/pull db [:ex/name] :ex/luke)))
         "no origins unless the opts ask for them")))
 
+(deftest superproperties
+  (let [db     (theo/transact!
+                 (theo/db (ModelFactory/createDefaultModel) {:prefixes prefixes})
+                 [[:ex/child :rdfs/subPropertyOf :ex/kin]
+                  [:ex/kin :rdfs/subPropertyOf :ex/related]
+                  [:ex/kin :rdfs/subPropertyOf '_b]
+                  [:ex/near :rdfs/subPropertyOf :ex/close]
+                  [:ex/close :rdfs/subPropertyOf :ex/near]
+                  [:ex/close :rdfs/subPropertyOf :ex/related]
+                  ["<http://other.org/p>" :rdfs/subPropertyOf :ex/related]])
+        rdfs   (theo/db (ModelFactory/createRDFSModel ^Model (:model db))
+                        {:prefixes prefixes})
+        supers {:ex/child              #{:ex/kin :ex/related}
+                :ex/kin                #{:ex/related}
+                :ex/near               #{:ex/related}
+                :ex/close              #{:ex/related}
+                "<http://other.org/p>" #{:ex/related}}]
+    (is (= supers (theo/superproperties db))
+        "transitive without inference, and without equivalent properties")
+    (is (= supers (select-keys (theo/superproperties rdfs) (keys supers)))
+        "the same with inference")))
+
+(deftest entailed-properties
+  (let [supers {:ex/child #{:ex/kin :ex/related}
+                :ex/kin   #{:ex/related}
+                :ex/name  #{:rdfs/label}}
+        collar {:rdf/about '_collar :ex/colour "red"}]
+    (is (= {:ex/child #{:ex/kin :ex/related}}
+           (theo/entailed-properties {:ex/child   #{:ex/a :ex/b}
+                                      :ex/kin     #{:ex/a :ex/b}
+                                      :ex/related :ex/a}
+                                     supers))
+        "an entailed property is listed under one that isn't")
+    (is (= {:ex/child #{:ex/related} :ex/kin #{:ex/related}}
+           (theo/entailed-properties {:ex/child   :ex/a
+                                      :ex/kin     :ex/b
+                                      :ex/related #{:ex/a :ex/b}}
+                                     supers))
+        "several subproperties together")
+    (is (= {}
+           (theo/entailed-properties {:ex/child :ex/a :ex/kin #{:ex/a :ex/c}}
+                                     supers))
+        "a property with a value of its own isn't entailed")
+    (is (= {:ex/name #{:rdfs/label}}
+           (theo/entailed-properties {:ex/name ["Rex"] :rdfs/label "Rex"}
+                                     supers))
+        "a vector of values and a single value")
+    (is (= {:ex/child #{:ex/kin}}
+           (theo/entailed-properties {:ex/child collar :ex/kin collar} supers))
+        "a blank node")))
+
 (deftest union-default-graph
   (let [dataset (TDB2Factory/createDataset)
         db      (theo/db dataset {:prefixes prefixes})
