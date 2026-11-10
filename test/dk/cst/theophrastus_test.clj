@@ -719,20 +719,27 @@
         "the default graph has no name")
     (is (= {:ex/p :ex/g1} (origins (at :union) {:origins #{:ex/g1}}))
         "only the origins selected")
-    (is (= {:ex/p #{:one :two} :ex/q :two}
-           (origins (at :union) {:origins {:ex/g1                     :one
-                                           "<http://example.com/g2>" :two}}))
-        "renamed")
-    (is (= {:ex/p :both :ex/q :both}
-           (origins (at :union) {:origins {:ex/g1 :both :ex/g2 :both}}))
-        "merged by one name")
     (is (= {:ex/p #{:ex/g1 :ex/g2}}
            (origins (at :union) {:default-origin :ex/g2}))
         "a value of the default origin and another has an entry")
+    (is (thrown-with-msg? ExceptionInfo #"needs all the origins"
+                          (origins (at :union) {:origins        #{:ex/g1}
+                                                :default-origin :ex/g2}))
+        "a value of a graph that isn't selected would read as the default")
     (is (thrown-with-msg? ExceptionInfo #"Not an origin: :nope"
                           (origins (at :union) {:origins #{:nope}})))
     (is (thrown-with-msg? ExceptionInfo #"Not an :origins option: :all"
-                          (origins (at :union) {:origins :all})))))
+                          (origins (at :union) {:origins :all}))))
+  (let [ds (DatasetFactory/createTxnMem)
+        db (theo/db ds {:prefixes prefixes :default-graph :union})]
+    (txn/calculate-write ds #(.add (.asDatasetGraph ds)
+                                   (convert/node '_g)
+                                   (convert/node :ex/a prefixes)
+                                   (convert/node :ex/p prefixes)
+                                   (convert/node "a")))
+    (is (= {:ex/p '_g}
+           (:origins (meta (theo/entity db :ex/a {:origins true}))))
+        "a graph named by a blank node, as its symbol")))
 
 (deftest transact-db
   (let [tdb2 (theo/transact! (theo/db (TDB2Factory/createDataset)

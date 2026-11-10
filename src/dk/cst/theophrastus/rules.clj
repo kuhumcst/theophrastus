@@ -63,7 +63,11 @@
   "An inference Model of the `reasoner` over the `data`, with the `schema`
   when given. Each is a db, a Model or a Graph, and the data is a new
   in-memory Model when there is none, as (theo/db {:transactional? false})
-  makes it."
+  makes it.
+
+  The Model reads a db whose :default-graph is a set of graphs as one graph
+  without a name, so theo/entity records the origin of its values as
+  :asserted."
   (^InfModel [reasoner]
    (inf-model reasoner (theo/db {:transactional? false})))
   (^InfModel [^Reasoner reasoner data]

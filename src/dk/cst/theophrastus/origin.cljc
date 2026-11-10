@@ -10,9 +10,10 @@
   - :default-origin, when it's given, is the origin of every value that
     has no entry.
 
-  An origin is the IRI of the named graph that holds a value, :asserted
-  for a graph without a name, :inferred when no graph holds the value, or
-  a set of these when several graphs hold it.")
+  An origin is the IRI of the named graph that holds a value (or the symbol
+  of the blank node that names the graph), :asserted for a graph without a
+  name, :inferred when no graph holds the value, or a set of these when
+  several graphs hold it.")
 
 (def special-origins
   "The origins that aren't the IRI of a named graph."
