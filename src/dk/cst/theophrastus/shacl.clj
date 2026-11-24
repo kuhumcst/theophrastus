@@ -8,11 +8,21 @@
             [dk.cst.theophrastus.term :as term]
             [dk.cst.theophrastus.txn :as txn])
   (:import [org.apache.jena.graph Graph GraphMemFactory GraphUtil Node]
-           [org.apache.jena.query Dataset]
+           [org.apache.jena.query Dataset Query]
            [org.apache.jena.rdf.model Model]
            [org.apache.jena.shacl ShaclValidator Shapes ValidationReport]
-           [org.apache.jena.shacl.validation ReportEntry]
-           [org.apache.jena.sparql.path P_Link Path]))
+           [org.apache.jena.shacl.engine Target TargetType ValidationContext]
+           [org.apache.jena.shacl.lib ShLib]
+           [org.apache.jena.shacl.parser Shape]
+           [org.apache.jena.shacl.validation ReportEntry VLib]
+           [org.apache.jena.shacl.vocabulary SHACL]
+           [org.apache.jena.sparql.core Var]
+           [org.apache.jena.sparql.exec QueryExec]
+           [org.apache.jena.sparql.path P_Link Path]
+           [org.apache.jena.sparql.syntax ElementAssign ElementBind ElementData
+            ElementMinus ElementService ElementSubQuery ElementVisitorBase
+            ElementWalker]
+           [org.apache.jena.system G]))
 
 (defn- shapes-graph
   "The Graph of the shapes in `x`, as parse takes them."
@@ -163,10 +173,80 @@
               (recur (into (subvec todo 1) imports) (conj seen g))))
           (mapv #(theo/named-graph db %) seen))))))
 
+;; SHACL, appendix A, has the rules for a query with a pre-bound variable.
+;; A VALUES for other variables is let through, since it binds nothing here.
+(defn- pre-bindable?
+  "Whether the SELECT `query` of a target has the same answer for one node
+  when ?this is pre-bound to it as when it's run in full.
+
+  It has, unless it binds ?this itself (with VALUES, BIND or AS), has a
+  MINUS, a SERVICE, a LIMIT or an OFFSET, or has a subquery that doesn't
+  return ?this."
+  [^Query query]
+  (let [?this   (Var/alloc "this")
+        fine?   (volatile! true)
+        visitor (proxy [ElementVisitorBase] []
+                  (visit [el]
+                    (when (or (instance? ElementMinus el)
+                              (instance? ElementService el)
+                              (and (instance? ElementData el)
+                                   (.contains (.getVars ^ElementData el) ?this))
+                              (and (instance? ElementBind el)
+                                   (= ?this (.getVar ^ElementBind el)))
+                              (and (instance? ElementAssign el)
+                                   (= ?this (.getVar ^ElementAssign el)))
+                              (and (instance? ElementSubQuery el)
+                                   (let [sub (.getQuery ^ElementSubQuery el)]
+                                     (not (and (.contains (.getProjectVars sub)
+                                                          ?this)
+                                               (pre-bindable? sub))))))
+                      (vreset! fine? false))))]
+    (and (not (.hasLimit query))
+         (not (.hasOffset query))
+         (not (.hasExpr (.getProject query) ?this))
+         (do (ElementWalker/walk (.getQueryPattern query) visitor)
+             @fine?))))
+
+;; SHACL-AF, section 3.1: a node is a target of a SPARQL-based target when
+;; its query has a solution with ?this pre-bound to the node
+(defn- target?
+  "Whether the `node` of the `data` is one of the nodes that the `target`
+  names.
+
+  A SPARQL-based target is asked about the one node when its query allows
+  it (see pre-bindable?). Jena runs the query in full for every node, which
+  is slow when the target names many nodes."
+  [^Target target ^Node node ^Graph data]
+  (let [shapes (.getShapesGraph target)
+        query  (when (and (= TargetType/targetExtension (.getTargetType target))
+                          (G/hasOneSP shapes (.getObject target) SHACL/select))
+                 (ShLib/extractSPARQLQuery shapes (.getObject target)))]
+    (if (and query (pre-bindable? query))
+      (with-open [qe (-> (QueryExec/graph data)
+                         (.query ^Query query)
+                         (.substitution (Var/alloc "this") node)
+                         (.build))]
+        (.hasNext (.select qe)))
+      (VLib/isFocusNode target node data))))
+
+(defn- node-report
+  "The validation report of the `node` of the `data` against the `shapes`
+  that it's a target of."
+  ^ValidationReport [^Shapes shapes ^Graph data ^Node node]
+  (let [context (ValidationContext/create shapes data)]
+    (doseq [^Shape shape (.getTargetShapes shapes)
+            :when (some #(target? % node data) (.getTargets shape))]
+      (VLib/validateShape context data shape node))
+    (.generateReport context)))
+
 (defn validate
   "The SHACL report of `db` (or only of its `node`) against the `shapes`, as
   a map of :conforms? and :results. The shapes are anything that parse
   takes, e.g. a file or a db. The report is made in one read transaction.
+
+  The report of a `node` has the results that the report of the whole db
+  has for it. A SPARQL-based target is only asked about that node, when its
+  query can be.
 
   Without `shapes`, the shapes graph is the one that the data names, as
   SHACL has it: the graphs that `db` names with sh:shapesGraph and those
@@ -186,12 +266,10 @@
          shapes   (parse shapes)]
      (txn/calculate-read
        db
-       #(let [validator (ShaclValidator/get)
-              g         (theo/jena-graph db)]
+       #(let [g (theo/jena-graph db)]
           (report->map (if (some? node)
-                         (.validate validator shapes g
-                                    ^Node (convert/node node prefixes))
-                         (.validate validator shapes g))
+                         (node-report shapes g (convert/node node prefixes))
+                         (.validate (ShaclValidator/get) shapes g))
                        prefixes))))))
 
 (defn by-severity

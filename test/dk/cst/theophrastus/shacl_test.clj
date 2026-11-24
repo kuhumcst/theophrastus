@@ -2,6 +2,7 @@
   "SHACL validation of a db, with the report as Clojure data."
   (:require [clojure.test :refer [deftest is]]
             [dk.cst.theophrastus :as theo]
+            [dk.cst.theophrastus.function :as function]
             [dk.cst.theophrastus.shacl :as shacl]
             [dk.cst.theophrastus.term :as term])
   (:import [clojure.lang ExceptionInfo]
@@ -69,6 +70,90 @@
             "only the node")
         (is (not (shacl/violations? luke)) "a warning isn't a violation"))
       (is (:conforms? (shacl/validate db shapes :ex/nobody))))))
+
+(def asked
+  "The nodes that the first target of target-shapes-ttl has asked about."
+  (atom #{}))
+
+(function/register! "<http://example.com/asked>"
+                    (fn [node]
+                      (swap! asked conj node)
+                      true)
+                    prefixes)
+
+(def target-shapes-ttl
+  "Five shapes with a SPARQL-based target, which each say that their nodes
+  need a name. The first three have a query that can be asked about one
+  node. The last two don't: the answer of a MINUS or a LIMIT for one node
+  depends on the other nodes."
+  "PREFIX ex: <http://example.com/>
+   PREFIX sh: <http://www.w3.org/ns/shacl#>
+   PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+   ex: sh:declare [ sh:prefix 'ex' ;
+                    sh:namespace 'http://example.com/'^^xsd:anyURI ] .
+   ex:AskedShape a sh:NodeShape ; sh:property ex:AskedName ;
+     sh:target [ a sh:SPARQLTarget ; sh:prefixes ex: ; sh:select
+       'SELECT ?this WHERE { ?this a ex:Person FILTER(ex:asked(?this)) }' ] .
+   ex:ValuesShape a sh:NodeShape ; sh:property ex:ValuesName ;
+     sh:target [ a sh:SPARQLTarget ; sh:prefixes ex: ; sh:select '''
+       SELECT ?this
+       WHERE { VALUES ?type { ex:Person ex:Dog } ?this a ?type }''' ] .
+   ex:SubqueryShape a sh:NodeShape ; sh:property ex:SubqueryName ;
+     sh:target [ a sh:SPARQLTarget ; sh:prefixes ex: ; sh:select
+       'SELECT ?this WHERE { { SELECT ?this WHERE { ?this a ex:Person } } }' ] .
+   ex:MinusShape a sh:NodeShape ; sh:property ex:MinusName ;
+     sh:target [ a sh:SPARQLTarget ; sh:prefixes ex: ; sh:select '''
+       SELECT ?this
+       WHERE { ?this a ex:Person MINUS { ?this ex:retired true } }''' ] .
+   ex:LimitShape a sh:NodeShape ; sh:property ex:LimitName ;
+     sh:target [ a sh:SPARQLTarget ; sh:prefixes ex: ; sh:select
+       'SELECT ?this WHERE { ?this a ex:Person } ORDER BY ?this LIMIT 1' ] .
+   ex:AskedName sh:path ex:name ; sh:minCount 1 .
+   ex:ValuesName sh:path ex:name ; sh:minCount 1 .
+   ex:SubqueryName sh:path ex:name ; sh:minCount 1 .
+   ex:MinusName sh:path ex:name ; sh:minCount 1 .
+   ex:LimitName sh:path ex:name ; sh:minCount 1 .")
+
+(def people
+  "Ann, who is retired, Jim and Luke, who is the only one with a name, and
+  a dog."
+  [[:ex/ann :rdf/type :ex/Person]
+   [:ex/ann :ex/retired true]
+   [:ex/jim :rdf/type :ex/Person]
+   [:ex/luke :rdf/type :ex/Person]
+   [:ex/luke :ex/name "Luke"]
+   [:ex/rex :rdf/type :ex/Dog]])
+
+(deftest sparql-targets
+  (let [shapes (shacl/parse (shapes-file target-shapes-ttl))]
+    (doseq [db [(theo/db (ModelFactory/createDefaultModel) {:prefixes prefixes})
+                (theo/db (TDB2Factory/createDataset) {:prefixes prefixes})]
+            :let [_      (theo/transact! db people)
+                  whole  (:results (shacl/validate db shapes))
+                  of     (fn [node]
+                           (set (filter #(= node (:focus-node %)) whole)))
+                  shapes-of (fn [node]
+                              (->> (shacl/validate db shapes node)
+                                   (:results)
+                                   (map :source-shape)
+                                   (set)))]]
+      (is (= 9 (count whole)))
+      (doseq [node [:ex/ann :ex/jim :ex/luke :ex/rex :ex/nobody]]
+        (is (= (of node) (set (:results (shacl/validate db shapes node))))
+            "the results that the whole report has for the node"))
+      (is (= #{:ex/AskedName :ex/ValuesName :ex/SubqueryName :ex/LimitName}
+             (shapes-of :ex/ann))
+          "a MINUS leaves her out, and a LIMIT only keeps her")
+      (is (= #{:ex/AskedName :ex/ValuesName :ex/SubqueryName :ex/MinusName}
+             (shapes-of :ex/jim)))
+      (is (= #{:ex/ValuesName} (shapes-of :ex/rex)))
+      (reset! asked #{})
+      (shacl/validate db shapes :ex/jim)
+      (is (= #{:ex/jim} @asked)
+          "a query that can be is only asked about the one node")
+      (shacl/validate db shapes)
+      (is (= #{:ex/ann :ex/jim :ex/luke} @asked)
+          "and run in full for the whole db"))))
 
 (deftest parse
   (let [f      (shapes-file shapes-ttl)
